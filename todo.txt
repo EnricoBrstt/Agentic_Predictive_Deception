@@ -1,3 +1,3 @@
 - nascondere nel codice di fakeshell.py i punti che smascherano l'honeypot (invio evento a orchestrator, presenza fakeshell come bash ecc.)
 - Migliorare comportamento forger agent
-- realizzare agent attaccante
+- [FATTO] realizzare agent attaccante -> attackerContainer/ (vedi CLAUDE.md)

@@ -53,12 +53,34 @@ services:
       - backend_net
     
   mcp-forgery:
-    build: 
+    build:
       context: ./mcpForgeryContainer
     networks:
       - honeypot_net
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # Scrive direttamente usando il socket di Docker nel container!
+
+  attacker:
+    build:
+      context: .                              # Root: riusa agent_connector.py/adapter_connector.py da agentContainer/
+      dockerfile: attackerContainer/Dockerfile
+    profiles: ["attacker"]                    # Non parte con un `docker-compose up` semplice: va lanciato esplicitamente
+    environment:
+      - HONEYPOT_HOST=honeypot
+      - HONEYPOT_PORT=2222
+      - HONEYPOT_USER=honeypot
+      - HONEYPOT_PASSWORD=password123
+      - PROVIDER=cloud                         # Modifica provider
+      - MODEL_NAME=deepseek/deepseek-v4-flash  # Modifica modello
+      - MAX_TURNS=25
+    secrets:
+      - llm_config_secret
+    volumes:
+      - ./attackerContainer/transcripts:/app/transcripts
+    networks:
+      - honeypot_net
+    depends_on:
+      - honeypot
 
 networks:
   honeypot_net:
