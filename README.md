@@ -61,29 +61,40 @@ The ChromaDB vector database and the historical attack corpus from the previous 
 The system is made up of **four Docker containers** (plus an optional fifth, on-demand **attacker** container) that communicate over two separate internal networks:
 
 ```
-┌──────────────────────────────────────────────┐
-│     ATTACKER (human, or attacker container)  │
-│              (SSH on port 2222)              │
-└───────────────────┬──────────────────────────┘
-                    │ SSH
-        ┌───────────▼────────────┐
-        │        honeypot        │  (honeypot_net)
-        │       Port: 2222       │  fakeshell.py
-        └───────────┬────────────┘
-                    │ HTTP POST /new_command        ▲
-                    │                               │ docker cp
-        ┌───────────▼────────────┐      ┌───────────┴──────────┐
-        │    agentic-system      │─────▶│     mcp-forgery      │
-        │  (honeypot_net +       │ SSE  │    (honeypot_net)    │
-        │   backend_net)         │      │     Docker API       │
-        │  FastAPI + LLM agents  │      └──────────────────────┘
-        └───────────┬────────────┘
-                    │ SSE (MCP)
-        ┌───────────▼────────────┐
-        │        backend         │  (backend_net)
-        │    ChromaDB + Logs     │
-        └────────────────────────┘
+┌───────────────────────────────┐
+│           ATTACKER            │
+│  human, or the "attacker"     │
+│  container driven by an LLM   │
+└───────────────┬───────────────┘
+                │ [1] SSH, port 2222
+                ▼
+┌───────────────────────────────┐
+│           HONEYPOT            │
+│  fakeshell.py                 │◄───────────┐
+│  runs the command for real    │            │ [6] the fake file
+└───────────────┬───────────────┘            │     appears in its
+                │ [2] POST /new_command      │     filesystem
+                ▼                            │
+┌───────────────────────────────┐    ┌───────┴───────────┐
+│        AGENTIC-SYSTEM         │    │    MCP-FORGERY    │
+│  PredictiveAgent              │[5] │  deploy_artifact  │
+│  ForgerAgent × k              ├───►│  via docker.sock  │
+└───────────────┬───────────────┘    └───────────────────┘
+                │ [3] [4] MCP tool calls
+                ▼
+┌───────────────────────────────┐
+│            BACKEND            │
+│  ChromaDB (RAG, read-only)    │
+│  sessions · artifact cache    │
+└───────────────────────────────┘
 ```
+
+1. The attacker logs in over SSH and types a command.
+2. The fakeshell runs the command for real and, in the meantime, notifies agentic-system without waiting for a reply.
+3. The PredictiveAgent uses the backend to save the command, read the session history and run RAG on ChromaDB, and predicts the `k` most likely next commands.
+4. Each ForgerAgent asks the backend whether a suitable fake file already exists; if not, it generates one with the LLM and saves it.
+5. The ForgerAgent hands the file to mcp-forgery.
+6. mcp-forgery writes it into the honeypot container through the Docker API: on the next command, the attacker finds it already there.
 
 **Docker networks:**
 - `honeypot_net`: connects honeypot, agentic-system, mcp-forgery and attacker. It is the "operational" deception network.
