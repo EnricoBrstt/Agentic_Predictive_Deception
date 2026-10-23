@@ -1,25 +1,12 @@
 """
-Orchestrator — Punto di ingresso e coordinamento del sistema agentico legato all'honeypot.
+HoneypotListener: FastAPI entry point of the agentic system.
 
-Questo modulo espone un server FastAPI che riceve gli eventi dalla fakeshell (ogni comando digitato da un attaccante) e coordina 
-il flusso di lavoro tra i vari agenti AI del sistema.
+fakeshell sends every command typed in the honeypot to POST /new_command, which runs the pipeline:
+    1. PredictiveAgent predicts the attacker's next k commands.
+    2. One ForgerAgent per prediction creates and deploys a fake artifact, all in parallel.
 
-La gestione del ciclo di vita avviene con asynccontextmanager. Il problema centrale è che gli agenti AI mantengono connessioni 
-di rete persistenti (SSE verso il server MCP backend) che devono essere aperte prima che il server inizi a ricevere richieste e 
-chiuse in modo ordinato allo shutdown. Per garantire questo, si utilizza il meccanismo 'lifespan' di FastAPI, decorato
-con asynccontextmanager. Tutto il codice prima dello 'yield' viene eseguito all'avvio dell'app, mentre tutto quello dopo 
-viene eseguito allo spegnimento.
-
-Per come è stato scritto il codice di lifespan, l'Orchestrator è esso stesso un async context manager con i due metodi:
-__aenter__ -> all'entrata apre le connessioni SSE di tutti gli agenti che ne hanno bisogno (chiamando a sua volta i loro metodi __aenter__)
-__aexit__ -> all'uscita le chiude in modo garantito anche in caso di eccezione (chiamando a sua volta i loro metodi __aexit__)
-
-L'istanza dell'orchestratore (con le connessioni già aperte) viene salvata in app.state.orch, rendendola accessibile a tutti 
-gli endpoint senza usare variabili globali.
-
-FLUSSO DI DISPATCH:
-    1. Fase Predizione: PredictiveAgent analizza il comando e predice i successivi.
-    2. Fase Falsario:   ForgerAgent prepara risposte ingannevoli basate sulla predizione.
+The agents keep persistent SSE connections to the MCP servers: the FastAPI lifespan opens them at
+startup and closes them at shutdown, and the listener is stored in app.state.orch.
 """
 
 from contextlib import asynccontextmanager
@@ -31,14 +18,14 @@ from pydantic import BaseModel
 from agent_predictive import PredictiveAgent
 from agent_forger import ForgerAgent
 
-# Carichiamo le variabili dal file .env (o dall'ambiente Docker)
+# Configuration from the container environment (see docker-compose.yml)
 PROVIDER = os.getenv("PROVIDER")
 MODEL_NAME = os.getenv("MODEL_NAME")
 BACKEND_MCP_URL = os.getenv("BACKEND_MCP_URL")
 FORGERY_MCP_URL = os.getenv("FORGERY_MCP_URL")
 NUM_PREDICTION = os.getenv("NUM_PREDICTION")
 
-# Struttura evento ricevuta da fakeshell
+# Event sent by fakeshell for each command
 class CommandEvent(BaseModel):
     session_id: str
     timestamp: str
@@ -53,86 +40,77 @@ class HoneypotListener:
         self.forgers: List[ForgerAgent] = [ForgerAgent(mcp_url_backend=BACKEND_MCP_URL, mcp_url_forgery=FORGERY_MCP_URL,model_name=MODEL_NAME, provider=PROVIDER, id= i) for i in range(int(NUM_PREDICTION))]
 
     async def __aenter__(self):
-        print("[HONEYPOT LISTENER] Apertura connessioni agenti...")
+        print("[HONEYPOT LISTENER] Opening agent connections...")
         await self.predictive.__aenter__()
         for forger in self.forgers:
             await forger.__aenter__()
-        print("[HONEYPOT LISTENER] Connessioni agenti aperte.")
+        print("[HONEYPOT LISTENER] Agent connections open.")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        print("[HONEYPOT LISTENER] Chiusura connessioni agenti...")
+        print("[HONEYPOT LISTENER] Closing agent connections...")
         await self.predictive.__aexit__(exc_type, exc_val, exc_tb)
         for forger in self.forgers:
             await forger.__aexit__(exc_type, exc_val, exc_tb)
-        print("[HONEYPOT LISTENER] Connessioni agenti chiuse.")
+        print("[HONEYPOT LISTENER] Agent connections closed.")
 
     async def dispatch(self, event: CommandEvent):
-        print(f"\n[HONEYPOT LISTENER] Nuovo comando intercettato: '{event.cmd}'")
+        print(f"\n[HONEYPOT LISTENER] New command: '{event.cmd}'")
 
-        # --- FASE 1: PREDIZIONE + RAG ---
-        print(f"[HONEYPOT LISTENER] Fase 1: Analisi e Predizione in corso...")
+        # --- PHASE 1: PREDICTION + RAG ---
+        print(f"[HONEYPOT LISTENER] Phase 1: predicting next commands...")
         predicted_cmd = await self.predictive.decide(event)
-        print(f"[HONEYPOT LISTENER] Comandi predetti: {predicted_cmd}")
-        print(f"[HONEYPOT LISTENER] Fase 1 terminata")
+        print(f"[HONEYPOT LISTENER] Predicted commands: {predicted_cmd}")
 
         if not predicted_cmd:
-            print("[HONEYPOT LISTENER] Nessuna predizione ricevuta. Salto la fase di creazione artefatti")
+            print("[HONEYPOT LISTENER] No predictions, skipping artifact creation.")
             return
-            
-        # --- FASE 2: FORGER ---
+
+        # --- PHASE 2: FORGERS ---
         num_active_forgers = min(len(predicted_cmd), len(self.forgers))
-        print(f"\n[HONEYPOT LISTENER] Fase 2: avvio lavoro di {num_active_forgers} agent forger in parallelo...")
+        print(f"\n[HONEYPOT LISTENER] Phase 2: running {num_active_forgers} forger agents in parallel...")
         tasks = [
             forger.decide(cmd, event)
             for cmd, forger in zip(predicted_cmd, self.forgers)
         ]
         asyncio_tasks = [asyncio.create_task(t) for t in tasks]
 
-        # Attendiamo massimo 180 secondi (3 minuti)
+        # Wait at most 3 minutes; late agents are cancelled below
         done, pending = await asyncio.wait(asyncio_tasks, timeout=180.0)
 
         result = []
 
-        # 1. Recuperiamo i risultati di chi ha finito in tempo
         for task in done:
             try:
-                # task.result() restituisce l'output, o lancia l'eccezione se l'agente è andato in crash
+                # result() re-raises the exception of a crashed agent
                 res = task.result()
                 result.append(res)
             except Exception as e:
-                print(f"[HONEYPOT LISTENER] ⚠️ Errore interno in uno degli agenti: {e}")
-                result.append([]) 
+                print(f"[HONEYPOT LISTENER] WARNING: forger agent failed: {e}")
+                result.append([])
 
-        # 2. Gestiamo i "ritardatari" (Quelli bloccati dopo 3 minuti)
         if pending:
-            print(f"\n[HONEYPOT LISTENER] ⚠️ TIMEOUT: {len(pending)} agenti non hanno finito entro 3 minuti.")
+            print(f"\n[HONEYPOT LISTENER] WARNING: timeout, cancelling {len(pending)} unfinished agents.")
             for task in pending:
                 task.cancel()
-        print(f"[HONEYPOT LISTENER] Artefatti generati: {result}")
-        print("[HONEYPOT LISTENER] Fase 2: fase 2 terminata per tutte le predizioni.")
+        print(f"[HONEYPOT LISTENER] Generated artifacts: {result}")
+        print("[HONEYPOT LISTENER] Phase 2 done.")
 
-# --- Lifespan: gestisce startup e shutdown dell'intera applicazione ---
+# --- Lifespan: agent connections are opened at startup and closed at shutdown ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    # Uscendo dal 'async with', __aexit__ chiude automaticamente tutte le connessioni
     async with HoneypotListener() as orch:
-        print("[HONEYPOT LISTENER] 🚀 Server pronto a ricevere eventi.")
-        app.state.orch = orch   
-        yield                   
+        print("[HONEYPOT LISTENER] Server ready to receive events.")
+        app.state.orch = orch
+        yield
 
 
-# Inizializzazione FastAPI con lifespan
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/new_command")
 async def handle_new_command(event: CommandEvent):
-    """
-    Endpoint di ricezione dalla fakeshell.
-    Recupera l'orchestratore dallo stato dell'app, già inizializzato con le
-    connessioni SSE aperte.
-    """
+    """Receive a command event from fakeshell and run the pipeline on it."""
     await app.state.orch.dispatch(event)
     return {"status": "success", "message": "Evento processato sequenzialmente"}

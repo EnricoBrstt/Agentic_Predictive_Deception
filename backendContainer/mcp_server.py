@@ -6,54 +6,49 @@ from fastmcp import FastMCP
 import chromadb
 from chromadb.utils import embedding_functions
 
-# Configurazione percorsi (interni al container backend)
+# Paths inside the container (bind-mounted from the host, see docker-compose.yml)
 DB_PATH = "/app/data/vector_db"
 LOG_PATH = "/app/data/sessions"
 ARTIFACTS_PATH = "/app/data/artifacts/artifacts.jsonl"
 
-# Inizializzazione MCP Server
 mcp = FastMCP("Agent-Backend")
-print("[BACKEND] Avvio del server Agent-Backend...")
+print("[BACKEND] Starting Agent-Backend MCP server...")
 
-# --- Inizializzazione ChromaDB ---
-print(f"[BACKEND] Connessione a ChromaDB in {DB_PATH}...")
+# --- ChromaDB ---
+print(f"[BACKEND] Opening ChromaDB at {DB_PATH}...")
 emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 db_client = chromadb.PersistentClient(path=DB_PATH)
 
 try:
     collection = db_client.get_collection(name="honeypot_attacks", embedding_function=emb_fn)
-    print("[BACKEND] Collection 'honeypot_attacks' caricata con successo.")
+    print("[BACKEND] Collection 'honeypot_attacks' loaded.")
 except Exception as e:
-    print("[BACKEND] ERRORE: Collection 'honeypot_attacks' non trovata. Hai eseguito lo script di indicizzazione?")
+    print("[BACKEND] ERROR: collection 'honeypot_attacks' not found. Was the indexing script run?")
     raise e
 
-#####################
-# Tool per PredictiveAgent
-#####################
+# --- PredictiveAgent tools ---
 
 @mcp.tool()
 def retrieve(current_context_list: List[str], k: int) -> str:
-    """Interroga il DB vettoriale e restituisce attacchi passati simili."""
-    print(f"\n[BACKEND][RAG] Ricevuta richiesta di Retrieve. Contesto attuale ({len(current_context_list)} comandi).")
-    
-    if not current_context_list: 
-        print("[BACKEND][RAG] Contesto vuoto, annullo la ricerca.")
+    """Query the vector DB and return similar past attacks."""
+    print(f"\n[BACKEND][RAG] Retrieve request, context of {len(current_context_list)} commands.")
+
+    if not current_context_list:
+        print("[BACKEND][RAG] Empty context, search skipped.")
         return ""
 
     query_text = " || ".join(current_context_list)
-    print(f"[BACKEND][RAG] Ricerca vettori per: '{query_text}'")
+    print(f"[BACKEND][RAG] Query: '{query_text}'")
 
-    # Query ai vettori già presenti nel DB
     results = collection.query(
         query_texts=[query_text],
         n_results=k
     )
 
     if not results['ids'] or len(results['ids'][0]) == 0:
-        print("[BACKEND][RAG] Nessun risultato simile trovato nel database.")
+        print("[BACKEND][RAG] No similar attacks found.")
         return ""
 
-    # Estrazione dati
     ids = results['ids'][0]
     docs = results['documents'][0]
     metas = results['metadatas'][0]
@@ -70,38 +65,38 @@ def retrieve(current_context_list: List[str], k: int) -> str:
             f"Attacker Next Move:\n{hist_next}\n\n"
         )
 
-    print(f"[BACKEND][RAG] Trovati {len(ids)} esempi storici. Restituisco i dati all'Agente.")
+    print(f"[BACKEND][RAG] Found {len(ids)} similar attacks.")
     return formatted_examples
 
 @mcp.tool()
 def log_session_event(session_id: str, event_data: dict) -> bool:
-    """Salva un nuovo comando nel file di log della sessione"""
-    print(f"\n📝 [BACKEND][LOG] Ricevuto nuovo evento per la sessione: {session_id}")
-    
+    """Append a command event to the session log file."""
+    print(f"\n[BACKEND][LOG] New event for session {session_id}")
+
     os.makedirs(LOG_PATH, exist_ok=True)
     file_path = os.path.join(LOG_PATH, f"session_{session_id}.jsonl")
-    
+
     with open(file_path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(event_data) + '\n')
-        
-    print(f"[BACKEND][LOG] Evento scritto con successo in {file_path}")
+
+    print(f"[BACKEND][LOG] Written to {file_path}")
     return True
 
 @mcp.tool()
 def get_session_history(session_id: str, window_size: int) -> list:
-    """Recupera gli ultimi N comandi dal file di sessione specificato"""
-    print(f"\n[BACKEND][LOG] Lettura ultimi {window_size} comandi per sessione: {session_id}")
-    
+    """Return the last window_size commands of the session."""
+    print(f"\n[BACKEND][LOG] Reading last {window_size} commands of session {session_id}")
+
     file_path = os.path.join(LOG_PATH, f"session_{session_id}.jsonl")
-    
-    if not os.path.exists(file_path): 
-        print("[BACKEND][LOG] File di sessione non ancora esistente. Restituisco lista vuota.")
+
+    if not os.path.exists(file_path):
+        print("[BACKEND][LOG] No session file yet, empty history.")
         return []
-    
+
     context_history = []
     with open(file_path, 'r', encoding='utf-8') as f:
         last_lines = deque(f, maxlen=window_size)
-    
+
         for line in last_lines:
             if line.strip():
                 try:
@@ -110,86 +105,74 @@ def get_session_history(session_id: str, window_size: int) -> list:
                         context_history.append(parsed_line['cmd'])
                 except json.JSONDecodeError:
                     continue
-                    
-    print(f"[BACKEND][LOG] Letti {len(context_history)} comandi storici.")
+
+    print(f"[BACKEND][LOG] Read {len(context_history)} commands.")
     return context_history
 
 import json
 
-#####################
-# Tool per ForgerAgent
-#####################
+# --- ForgerAgent tools ---
 
 @mcp.tool()
 def save_artifact(predicted_command: str, artifact_data: dict | str) -> bool:
-    """
-    Salva un nuovo artefatto in modalità APPEND, gestendo in modo sicuro
-    sia dizionari Python che stringhe JSON grezze.
-    """
-    print(f"\n[BACKEND][ARTIFACTS] Salvataggio nuovo artefatto per: '{predicted_command}'")
-    
-    # 1. CONTROLLO DIFENSIVO: Se l'LLM ha passato una stringa, la trasformiamo in dizionario
+    """Append an artifact to the JSONL cache; accepts a dict or a raw JSON string."""
+    print(f"\n[BACKEND][ARTIFACTS] Saving artifact for '{predicted_command}'")
+
+    # The LLM may pass the artifact as a JSON string
     if isinstance(artifact_data, str):
         try:
             artifact_data = json.loads(artifact_data)
         except json.JSONDecodeError as e:
-            print(f"[BACKEND][ARTIFACTS] L'agente ha fornito un JSON non valido: {e}")
+            print(f"[BACKEND][ARTIFACTS] Invalid JSON from the agent: {e}")
             return False
 
     os.makedirs(os.path.dirname(ARTIFACTS_PATH), exist_ok=True)
-    
-    # 2. Creazione del record pulito con JSON annidato
+
     record = {
         "command": predicted_command,
         "artifact": artifact_data
     }
-    
+
     try:
         with open(ARTIFACTS_PATH, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record) + '\n')
-        print("[BACKEND][ARTIFACTS] Artefatto appeso con successo.")
+        print("[BACKEND][ARTIFACTS] Artifact saved.")
         return True
     except Exception as e:
-        print(f"[BACKEND][ARTIFACTS] Errore durante il salvataggio: {e}")
+        print(f"[BACKEND][ARTIFACTS] ERROR saving artifact: {e}")
         return False
 
 @mcp.tool()
 def get_artifact(predicted_command: str) -> str:
-    """
-    Cerca nel file JSONL se esiste un artefatto per il comando predetto.
-    Restituisce il JSON dell'artefatto come stringa se trovato, altrimenti stringa vuota.
-    """
-    print(f"\n[BACKEND][ARTIFACTS] Ricerca artefatto per il comando: '{predicted_command}'")
-    
+    """Return the latest cached artifact for the command as a JSON string, or "" if there is none."""
+    print(f"\n[BACKEND][ARTIFACTS] Looking up artifact for '{predicted_command}'")
+
     if not os.path.exists(ARTIFACTS_PATH):
-        print("[BACKEND][ARTIFACTS] File artifacts.jsonl non esiste ancora.")
+        print("[BACKEND][ARTIFACTS] No artifacts.jsonl yet.")
         return ""
 
     latest_match = None
 
     try:
-        # Leggiamo il file JSONL riga per riga
         with open(ARTIFACTS_PATH, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.strip():
                     data = json.loads(line)
-                    # Aggiorniamo latest_match ogni volta che troviamo il comando.
-                    # Così alla fine del ciclo avremo sempre l'artefatto più recente!
+                    # Keep the last match: the most recent artifact wins
                     if data.get("command") == predicted_command:
                         latest_match = data.get("artifact")
-                        
-    except json.JSONDecodeError:
-        print("[BACKEND][ARTIFACTS] Trovata una riga corrotta durante la lettura.")
 
-    # Il momento della verità: la restituzione!
+    except json.JSONDecodeError:
+        print("[BACKEND][ARTIFACTS] Corrupted line in artifacts.jsonl.")
+
     if latest_match:
-        print(f"[BACKEND][ARTIFACTS] Artefatto trovato per '{predicted_command}'.")
-        # Restituiamo ESATTAMENTE l'oggetto "artifact" (il JSON del Forger)
+        print(f"[BACKEND][ARTIFACTS] Cache hit for '{predicted_command}'.")
+        # Only the 'artifact' object, as produced by the forger
         return json.dumps(latest_match)
-    
-    print("[BACKEND][ARTIFACTS] Nessun artefatto pre-esistente trovato.")
+
+    print("[BACKEND][ARTIFACTS] Cache miss.")
     return ""
 
 if __name__ == "__main__":
-    print("[BACKEND] MCP Server in ascolto. Pronto a servire gli agents sulla porta 8000...")
+    print("[BACKEND] MCP server listening on port 8000 (SSE).")
     mcp.run(transport="sse",host="0.0.0.0", port=8000)
