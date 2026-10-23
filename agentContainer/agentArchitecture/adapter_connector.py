@@ -53,7 +53,8 @@ class OpenAIChatWrapper:
                 self.history.append(tool_result)
 
         # 2. Prepara la chiamata
-        kwargs = {"model": self.model, "messages": self.history, "temperature": 0.0}
+        # max_tokens limita il credito che OpenRouter riserva per ogni richiesta in corso (evita errori 402)
+        kwargs = {"model": self.model, "messages": self.history, "temperature": 0.0, "max_tokens": 2048}
         if self.tools:
             kwargs["tools"] = self.tools
 

@@ -62,10 +62,8 @@ def trigger_ai(cmd, cwd):
     # Chiamata bloccante all'Orchestratore (Max 2.5 secondi)
     try:
         requests.post(ORCHESTRATOR_URL, json=entry, timeout=0.1)
-    except ReadTimeout:
-        pass
-    except Exception as e:
-        print(f"\n[DEBUG] Errore imprevisto di rete: {e}\n")
+    except Exception:
+        # Silenzioso: l'attaccante non deve accorgersi dell'orchestratore (anche se spento)
         pass
 
 # Ambiente realistico

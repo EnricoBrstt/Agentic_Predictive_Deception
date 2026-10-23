@@ -22,13 +22,15 @@ services:
       - BACKEND_MCP_URL=http://backend:8000/sse
       - FORGERY_MCP_URL=http://mcp-forgery:8000/sse
       - PROVIDER=cloud                                                    # Modifica provider
-      - MODEL_NAME=deepseek/deepseek-v4-flash                             # Modifica modello
+      - MODEL_NAME=deepseek/deepseek-chat                           # Modifica modello
       - NUM_PREDICTION=5
     secrets:
       - llm_config_secret
-    depends_on:
-      - backend
-      - mcp-forgery
+    depends_on:                               # Aspetta che i server MCP siano pronti, non solo avviati
+      backend:
+        condition: service_healthy
+      mcp-forgery:
+        condition: service_healthy
     restart: unless-stopped
 
   backend:
@@ -51,7 +53,12 @@ services:
           create_host_path: false
     networks:
       - backend_net
-    
+    healthcheck:                              # Pronto solo quando la porta 8000 accetta connessioni
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
   mcp-forgery:
     build:
       context: ./mcpForgeryContainer
@@ -59,6 +66,11 @@ services:
       - honeypot_net
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # Scrive direttamente usando il socket di Docker nel container!
+    healthcheck:                              # Pronto solo quando la porta 8000 accetta connessioni
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
 
   attacker:
     build:
