@@ -1,2 +1,6 @@
-.*env
+.env
+.env.*
 attackerContainer/transcripts/
+data/
+__pycache__/
+*.pyc

@@ -15,34 +15,28 @@ import glob
 import requests
 from requests.exceptions import ReadTimeout
 
-# L'URL del futuro Orchestratore AI (Agent_Team)
-# Quando testeremo tutto con docker-compose, 'ai-orchestrator' sarà il nome del servizio.
-# Per ora, usiamo una variabile d'ambiente per poterlo testare localmente.
+# Agentic system endpoint notified on every command (set in docker-compose.yml)
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://agentic-system:8000/new_command")
 
-# Informazioni utente simulate
+# User and host shown in the prompt
 user = getpass.getuser()
 hostname = socket.gethostname()
 
-# Recupera l'IP reale dell'attaccante dalle variabili SSH
+# Attacker IP from the SSH environment
 ssh_client = os.environ.get('SSH_CLIENT', '')
 if ssh_client:
     attacker_ip = ssh_client.split()[0]
 else:
     attacker_ip = "127.0.0.1"
 
-# Logging Locale (Opzionale/Backup)
+# Local backup log of the commands
 LOG_FILE = "/tmp/fakeshell_local.json"
 
 session_date = time.strftime("%Y-%m-%d")
 SESSION_ID = f"{session_date}_{attacker_ip.replace('.','-')}"
 
 def trigger_ai(cmd, cwd):
-    """
-    Invia l'evento all'Orchestratore AI e attende una risposta.
-    Se l'Orchestratore è lento o irraggiungibile, fallisce silenziosamente
-    permettendo alla shell di continuare.
-    """
+    """Notify the agentic system of a command without waiting for it; failures are silent."""
     entry = {
         "session_id": SESSION_ID,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -52,23 +46,21 @@ def trigger_ai(cmd, cwd):
         "cmd": cmd
     }
     
-    # Log di backup locale
+    # Local backup log
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
 
-    # Chiamata bloccante all'Orchestratore (Max 2.5 secondi)
+    # Fire-and-forget: the 0.1 s timeout returns at once while the agents keep working
     try:
         requests.post(ORCHESTRATOR_URL, json=entry, timeout=0.1)
-    except ReadTimeout:
-        pass
-    except Exception as e:
-        print(f"\n[DEBUG] Errore imprevisto di rete: {e}\n")
+    except Exception:
+        # Silent: the attacker must never notice the agentic system, even when it is down
         pass
 
-# Ambiente realistico
+# Realistic environment for the spawned bash
 env = os.environ.copy()
 env.update({
     "USER": user,
@@ -133,7 +125,7 @@ def completer(text, state):
 readline.set_completer(completer)
 readline.set_completer_delims(" \t\n;")
 
-# Stampa finto MOTD per maggiore credibilità
+# Fake Ubuntu MOTD
 print("Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-82-generic x86_64)\n")
 print(" * Documentation:  https://help.ubuntu.com")
 print(" * Management:     https://landscape.canonical.com")
@@ -183,10 +175,10 @@ while True:
             print("cd error:", e)
         continue
 
-    # --- CHIAMATA ALL'INTELLIGENZA ARTIFICIALE ---
+    # --- Notify the agentic system ---
     trigger_ai(cmd, cwd)
 
-    # --- ESECUZIONE REALE ---
+    # --- Run the command for real in a pty ---
     try:
         pid, fd = pty.fork()
         if pid == 0:

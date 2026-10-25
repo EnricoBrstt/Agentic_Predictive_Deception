@@ -1,22 +1,21 @@
 import json
 
 class UnifiedFunctionCall:
-    """Oggetto standardizzato per le chiamate ai tool, indipendente dal provider."""
+    """Provider-independent tool call."""
     def __init__(self, name, args, call_id=None):
         self.name = name
         self.args = args
-        # call_id è usato solo da OpenAI per collegare tool_result al tool_call.
-        # Per Google è sempre None: Part.from_function_response non richiede un id.
+        # OpenAI links each tool result to its call through call_id; always None for Google
         self.id = call_id
 
 class UnifiedResponse:
-    """Risposta standardizzata restituita al PredictiveAgent, indipendente dal provider."""
+    """Provider-independent model reply: text plus tool calls."""
     def __init__(self, text="", function_calls=None):
         self.text = text
         self.function_calls = function_calls or []
 
 
-# --- WRAPPERS PER LE SESSIONI DI CHAT ---
+# --- Chat session wrappers ---
 
 class GoogleChatWrapper:
     def __init__(self, google_chat):
@@ -29,7 +28,7 @@ class GoogleChatWrapper:
         function_calls = []
         if response.function_calls:
             for fc in response.function_calls:
-                # Google non espone un call_id: passiamo None esplicitamente (vedi UnifiedFunctionCall)
+                # Google has no call_id
                 function_calls.append(UnifiedFunctionCall(name=fc.name, args=fc.args, call_id=None))
 
         return UnifiedResponse(text, function_calls)
@@ -42,35 +41,33 @@ class OpenAIChatWrapper:
         self.history = [{"role": "system", "content": system_instruction}]
 
     async def send_message(self, message):
-        # 1. Aggiunge il messaggio utente o i risultati dei tool alla cronologia
+        # 1. Append the user message or the tool results to the history
         if isinstance(message, str):
             self.history.append({"role": "user", "content": message})
         elif isinstance(message, list):
             if not message:
-                raise ValueError("Lista tool_responses vuota passata a send_message: nessun tool result da inviare.")
-            # I tool results sono già formattati da AgentConnector.format_tool_response
+                raise ValueError("Empty tool_responses list passed to send_message.")
+            # Already formatted by AgentConnector.format_tool_response
             for tool_result in message:
                 self.history.append(tool_result)
 
-        # 2. Prepara la chiamata
-        kwargs = {"model": self.model, "messages": self.history, "temperature": 0.0}
+        # 2. max_tokens caps the credit OpenRouter reserves for each in-flight request (avoids 402 errors)
+        kwargs = {"model": self.model, "messages": self.history, "temperature": 0.0, "max_tokens": 2048}
         if self.tools:
             kwargs["tools"] = self.tools
 
-        # 3. Esegue la chiamata API
         response = await self.client.chat.completions.create(**kwargs)
         msg = response.choices[0].message
 
-        # 4. Aggiunge la risposta dell'assistente alla history (obbligatorio per OpenAI:
-        #    il messaggio con tool_calls deve precedere i tool results nel turno successivo)
+        # 3. Keep the assistant reply in the history: OpenAI requires the tool_calls message
+        #    right before the matching tool results
         self.history.append(msg)
 
-        # 5. Estrae testo e tool call in formato unificato
+        # 4. Convert to the unified format (tool arguments arrive as a JSON string)
         text = msg.content or ""
         function_calls = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                # OpenAI restituisce gli argomenti come stringa JSON: deserializziamo
                 args = json.loads(tc.function.arguments)
                 function_calls.append(UnifiedFunctionCall(name=tc.function.name, args=args, call_id=tc.id))
 

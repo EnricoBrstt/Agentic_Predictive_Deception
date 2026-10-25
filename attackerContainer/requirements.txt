@@ -1,3 +1,7 @@
 google-genai>=0.3.0
 openai>=1.14.0
 paramiko>=3.4.0
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-openai>=0.2.0

@@ -21,14 +21,16 @@ services:
     environment:
       - BACKEND_MCP_URL=http://backend:8000/sse
       - FORGERY_MCP_URL=http://mcp-forgery:8000/sse
-      - PROVIDER=cloud                                                    # Modifica provider
-      - MODEL_NAME=deepseek/deepseek-v4-flash                             # Modifica modello
-      - NUM_PREDICTION=5
+      - PROVIDER=cloud                        # cloud | local
+      - MODEL_NAME=deepseek/deepseek-chat     # LLM model
+      - NUM_PREDICTION=3
     secrets:
       - llm_config_secret
-    depends_on:
-      - backend
-      - mcp-forgery
+    depends_on:                               # Wait until the MCP servers accept connections
+      backend:
+        condition: service_healthy
+      mcp-forgery:
+        condition: service_healthy
     restart: unless-stopped
 
   backend:
@@ -51,30 +53,40 @@ services:
           create_host_path: false
     networks:
       - backend_net
-    
+    healthcheck:                              # Healthy once port 8000 accepts connections
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
   mcp-forgery:
     build:
       context: ./mcpForgeryContainer
     networks:
       - honeypot_net
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock # Scrive direttamente usando il socket di Docker nel container!
+      - /var/run/docker.sock:/var/run/docker.sock   # Docker API access to write files into the honeypot
+    healthcheck:                              # Healthy once port 8000 accepts connections
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
 
   attacker:
     build:
-      context: .                              # Root: riusa agent_connector.py/adapter_connector.py da agentContainer/
-      dockerfile: attackerContainer/Dockerfile
-    profiles: ["attacker"]                    # Non parte con un `docker-compose up` semplice: va lanciato esplicitamente
+      context: ./attackerContainer
+    profiles: ["attacker"]                    # Not started by a plain `docker compose up`: run it explicitly
     environment:
       - HONEYPOT_HOST=honeypot
       - HONEYPOT_PORT=2222
       - HONEYPOT_USER=honeypot
       - HONEYPOT_PASSWORD=password123
-      - PROVIDER=cloud                         # Modifica provider
-      - MODEL_NAME=deepseek/deepseek-v4-flash  # Modifica modello
+      - PROVIDER=cloud                        # cloud | local
+      - MODEL_NAME=deepseek/deepseek-chat     # LLM model
       - MAX_TURNS=25
+      - LLM_SECRET_FILE=/run/secrets/llm_config_secret_attacker   # key separate from the defense
     secrets:
-      - llm_config_secret
+      - llm_config_secret_attacker
     volumes:
       - ./attackerContainer/transcripts:/app/transcripts
     networks:
@@ -91,3 +103,5 @@ networks:
 secrets:
   llm_config_secret:
     file: ./.env
+  llm_config_secret_attacker:          # attacker's own key (see .env.attacker)
+    file: ./.env.attacker
