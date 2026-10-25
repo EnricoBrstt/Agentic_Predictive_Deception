@@ -399,7 +399,7 @@ LLM_SDK=openrouter       # or: google, openai
 ### Startup
 
 ```bash
-git clone https://github.com/melomatte/agenticPredictiveDeception.git
+git clone [https://github.com/melomatte/agenticPredictiveDeception.git](https://github.com/EnricoBrstt/Agentic_Predictive_Deception)
 cd agenticPredictiveDeception
 
 docker-compose up --build -d
