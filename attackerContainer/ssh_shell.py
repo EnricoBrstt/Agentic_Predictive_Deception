@@ -1,18 +1,11 @@
 """
-SSHShellSession — Guida interattiva della fakeshell dell'honeypot via un canale SSH persistente.
+SSHShellSession: drives the honeypot fakeshell over one persistent SSH channel.
 
-fakeshell.py (honeypotContainer/fakeshell.py) mantiene 'cwd' come stato Python in-process per
-l'intera sessione di login: per questo serve un UNICO canale SSH persistente (paramiko
-invoke_shell()) e non un exec per comando.
-
-Per sapere quando l'output di un comando e' terminato, non si usa un sentinel-echo
-(es. "; echo __DONE__") perche' si romperebbe silenziosamente su 'cd': fakeshell intercetta
-cmd.startswith("cd") PRIMA di spawnare bash, quindi il marker non verrebbe mai eseguito/echoed.
-
-Si rileva invece la comparsa del PROSSIMO PROMPT via regex sul formato ANSI esatto generato da
-fakeshell:
+fakeshell.py keeps 'cwd' as in-process state for the whole login, so a single invoke_shell() channel
+is used instead of one exec per command. The end of a command's output is detected by matching the
+next fakeshell prompt (exact ANSI format below) rather than a sentinel echo, which would never run
+after 'cd' because fakeshell handles cd itself without spawning bash:
     f"\\033[1;32m{user}@{hostname}\\033[0m:\\033[1;34m{cwd}\\033[0m{symbol} "
-Questo funziona in modo uniforme per comandi normali, 'cd' ed errori, senza casi speciali.
 """
 
 import re
@@ -26,8 +19,7 @@ PROMPT_RE = re.compile(
     rb"\x1b\[1;34m(?P<cwd>[^\x1b]+)\x1b\[0m(?P<symbol>[#$]) $"
 )
 
-# Comandi che aprono pager/editor interattivi: la fakeshell li esegue realmente via bash,
-# quindi possono bloccare il canale in attesa di input umano che non arrivera' mai.
+# Interactive pagers/editors: fakeshell really runs them, so they can block the channel waiting for input
 INTERACTIVE_HINTS = ("top", "less", "more", "vim", "vi ", "nano", "man ", "watch")
 
 
@@ -40,8 +32,7 @@ class ShellTurnResult:
 
 
 class SSHShellSession:
-    """Wrapper sincrono attorno a un canale interattivo paramiko. Le chiamate bloccanti vanno
-    eseguite dal chiamante dentro asyncio.to_thread() per non bloccare l'event loop."""
+    """Synchronous wrapper around an interactive paramiko channel; callers run it in asyncio.to_thread()."""
 
     def __init__(self, host, port, username, password,
                  connect_retries=5, connect_retry_delay=2.0,
@@ -59,17 +50,15 @@ class SSHShellSession:
         self._client: paramiko.SSHClient | None = None
         self._channel: paramiko.Channel | None = None
 
-    # --- Ciclo di vita ---
+    # --- Lifecycle ---
 
     def connect(self):
-        """Connette con retry (docker-compose depends_on garantisce solo l'avvio del
-        container, non che sshd sia gia' in ascolto sulla 2222)."""
+        """Connect with retries: depends_on only waits for the container to start, not for sshd."""
         last_err = None
         for attempt in range(1, self.connect_retries + 1):
             try:
                 client = paramiko.SSHClient()
-                # Host key rigenerata ad ogni build dell'immagine honeypot: nessun TOFU store
-                # persistente ha senso qui, l'honeypot e' il nostro stesso target di test.
+                # The honeypot host key changes on every build and it is our own test target: accept it
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 client.connect(
                     hostname=self.host,
@@ -87,10 +76,10 @@ class SSHShellSession:
                 return
             except Exception as e:
                 last_err = e
-                print(f"[SSH_SHELL] Tentativo {attempt}/{self.connect_retries} fallito: {e}")
+                print(f"[SSH_SHELL] Attempt {attempt}/{self.connect_retries} failed: {e}")
                 if attempt < self.connect_retries:
                     time.sleep(self.connect_retry_delay)
-        raise ConnectionError(f"Impossibile connettersi a {self.host}:{self.port} dopo {self.connect_retries} tentativi: {last_err}")
+        raise ConnectionError(f"Cannot connect to {self.host}:{self.port} after {self.connect_retries} attempts: {last_err}")
 
     def close(self):
         if self._channel:
@@ -107,27 +96,26 @@ class SSHShellSession:
             self._client = None
 
     def drain_banner(self) -> ShellTurnResult:
-        """Consuma MOTD + banner + primo prompt, prima che venga inviato alcun comando."""
+        """Consume MOTD, banner and first prompt before any command is sent."""
         return self._read_until_prompt()
 
-    # --- Esecuzione comandi ---
+    # --- Commands ---
 
     def run_command(self, command: str) -> ShellTurnResult:
         if self._channel is None:
-            raise RuntimeError("[SSH_SHELL] Canale non connesso. Chiamare connect() prima.")
+            raise RuntimeError("[SSH_SHELL] Channel not connected. Call connect() first.")
 
         self._channel.send((command + "\n").encode("utf-8"))
         result = self._read_until_prompt()
 
-        # Best-effort: la prima riga catturata puo' essere l'eco del comando appena inviato
-        # (dipende dalle impostazioni termios della pty lato fakeshell durante l'input()).
+        # Best effort: drop the echo of the command if the fakeshell pty sent it back
         lines = result.output.split("\n", 1)
         if lines and lines[0].strip() == command.strip():
             result.output = lines[1] if len(lines) > 1 else ""
 
         return result
 
-    # --- Lettura fino al prompt ---
+    # --- Read until the next prompt ---
 
     def _read_until_prompt(self) -> ShellTurnResult:
         buf = bytearray()
@@ -142,7 +130,7 @@ class SSHShellSession:
 
             if chunk is not None:
                 if chunk == b"":
-                    # EOF: il target ha chiuso la connessione (exit/quit/logout).
+                    # EOF: the target closed the connection (exit/quit/logout)
                     return ShellTurnResult(
                         output=self._decode(bytes(buf)), cwd=None, eof=True, timed_out=False
                     )
@@ -155,8 +143,8 @@ class SSHShellSession:
 
             if time.monotonic() >= deadline:
                 if not sent_ctrl_c:
-                    # Probabile comando interattivo (pager/editor): tentiamo il recovery.
-                    print("[SSH_SHELL] Timeout senza prompt: invio Ctrl-C per tentare il recovery.")
+                    # Probably an interactive program: try Ctrl-C once
+                    print("[SSH_SHELL] No prompt before timeout, sending Ctrl-C.")
                     try:
                         self._channel.send(b"\x03")
                     except Exception:
@@ -166,7 +154,7 @@ class SSHShellSession:
                     continue
                 return ShellTurnResult(
                     output=self._decode(bytes(buf))
-                    + "\n<TIMEOUT: il comando non ha prodotto un nuovo prompt entro il timeout, inviato Ctrl-C>",
+                    + "\n<TIMEOUT: the command produced no new prompt within the timeout, sent Ctrl-C>",
                     cwd=None,
                     eof=False,
                     timed_out=True,

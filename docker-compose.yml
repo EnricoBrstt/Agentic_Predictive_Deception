@@ -23,7 +23,7 @@ services:
       - FORGERY_MCP_URL=http://mcp-forgery:8000/sse
       - PROVIDER=cloud                        # cloud | local
       - MODEL_NAME=deepseek/deepseek-chat     # LLM model
-      - NUM_PREDICTION=5
+      - NUM_PREDICTION=3
     secrets:
       - llm_config_secret
     depends_on:                               # Wait until the MCP servers accept connections
@@ -74,19 +74,19 @@ services:
 
   attacker:
     build:
-      context: .                              # Root: riusa agent_connector.py/adapter_connector.py da agentContainer/
-      dockerfile: attackerContainer/Dockerfile
-    profiles: ["attacker"]                    # Non parte con un `docker-compose up` semplice: va lanciato esplicitamente
+      context: ./attackerContainer
+    profiles: ["attacker"]                    # Not started by a plain `docker compose up`: run it explicitly
     environment:
       - HONEYPOT_HOST=honeypot
       - HONEYPOT_PORT=2222
       - HONEYPOT_USER=honeypot
       - HONEYPOT_PASSWORD=password123
-      - PROVIDER=cloud                         # Modifica provider
-      - MODEL_NAME=deepseek/deepseek-v4-flash  # Modifica modello
+      - PROVIDER=cloud                        # cloud | local
+      - MODEL_NAME=deepseek/deepseek-chat     # LLM model
       - MAX_TURNS=25
+      - LLM_SECRET_FILE=/run/secrets/llm_config_secret_attacker   # key separate from the defense
     secrets:
-      - llm_config_secret
+      - llm_config_secret_attacker
     volumes:
       - ./attackerContainer/transcripts:/app/transcripts
     networks:
@@ -103,3 +103,5 @@ networks:
 secrets:
   llm_config_secret:
     file: ./.env
+  llm_config_secret_attacker:          # attacker's own key (see .env.attacker)
+    file: ./.env.attacker
