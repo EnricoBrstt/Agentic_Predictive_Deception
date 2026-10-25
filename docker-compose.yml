@@ -8,6 +8,7 @@ services:
       - ORCHESTRATOR_URL=http://agentic-system:8000/new_command
     networks:
       - honeypot_net
+      - attack_net
     restart: unless-stopped
     depends_on:
       - agentic-system
@@ -90,7 +91,8 @@ services:
     volumes:
       - ./attackerContainer/transcripts:/app/transcripts
     networks:
-      - honeypot_net
+      - attack_net                            # Reaches only the honeypot, never the defense
+
     depends_on:
       - honeypot
 
@@ -98,6 +100,8 @@ networks:
   honeypot_net:
     driver: bridge
   backend_net:
+    driver: bridge
+  attack_net:                                 # Attacker <-> honeypot only
     driver: bridge
 
 secrets:
